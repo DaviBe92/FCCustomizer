@@ -1,0 +1,903 @@
+import FreeCAD as App
+import FreeCADGui as Gui
+from PySide6 import QtWidgets, QtCore, QtGui
+import re
+
+class VariableRowWidget(QtWidgets.QWidget):
+    
+    def __init__(self, var_data, update_callback, edit_callback, reorder_callback, editing_locked=False, parent=None):
+        super().__init__(parent)
+        self.var = var_data
+        self.update_callback = update_callback
+        self.edit_callback = edit_callback
+        self.reorder_callback = reorder_callback
+        self.editing_locked = editing_locked
+        self._hovered = False
+        self._drag_start_pos = None
+        self._dragging = False
+        
+        self.setObjectName(f"vr_{var_data['row']}")
+        self.setMouseTracking(True)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setAcceptDrops(True)
+        
+        self.init_ui()
+
+    def init_ui(self):
+        var_type = self.var["type"].lower()
+        
+        main_layout = QtWidgets.QHBoxLayout(self)
+        main_layout.setContentsMargins(4, 4, 4, 4)
+        main_layout.setSpacing(4)
+        
+        # Drag Handle
+        self.drag_handle = QtWidgets.QLabel("⠿")
+        self.drag_handle.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.drag_handle.setStyleSheet("font-size: 18px; color: #666; padding: 2px;")
+        self.drag_handle.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
+        self.drag_handle.setToolTip("Drag to reorder")
+        self.drag_handle.mousePressEvent = self.drag_handle_mouse_press
+        self.drag_handle.mouseMoveEvent = self.drag_handle_mouse_move
+        self.drag_handle.mouseReleaseEvent = self.drag_handle_mouse_release
+        main_layout.addWidget(self.drag_handle)
+        
+        # Content Area
+        content_container = QtWidgets.QWidget()
+        if not self.editing_locked:
+            content_container.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            
+        content_layout = QtWidgets.QVBoxLayout(content_container)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(2)
+        
+        # Name Label
+        label_text = self.var["name"]
+        name_label = QtWidgets.QLabel(label_text)
+        name_label.setStyleSheet("font-size: 12px; font-weight: bold;")
+        if self.var.get("tooltip"):
+            name_label.setToolTip(self.var["tooltip"])
+        content_layout.addWidget(name_label)
+        
+        # Input Controls
+        control_layout = QtWidgets.QHBoxLayout()
+        
+        if var_type in ["boolean", "bool"]:
+            self.checkbox = QtWidgets.QCheckBox("Enabled")
+            self.checkbox.setChecked(str(self.var["value_raw"]).strip("'").lower() in ['true', '1'])
+            self.checkbox.toggled.connect(self.on_bool_changed)
+            control_layout.addWidget(self.checkbox)
+            
+        elif var_type in ["string", "str"]:
+            self.line_edit = QtWidgets.QLineEdit(str(self.var["value_raw"]).strip("'"))
+            self.line_edit.setStyleSheet("font-size: 11px;")
+            self.line_edit.editingFinished.connect(self.on_string_changed)
+            control_layout.addWidget(self.line_edit)
+            
+        else:
+            self.build_numeric_ui(control_layout, is_int=(var_type in ["integer", "int"]))
+            
+        content_layout.addLayout(control_layout)
+        main_layout.addWidget(content_container, 1)
+
+    def build_numeric_ui(self, layout, is_int):
+        min_str = self.var.get("min", "")
+        max_str = self.var.get("max", "")
+        
+        def safe_float(val):
+            try: return float(val)
+            except ValueError: return 0.0
+        
+        v_min = safe_float(min_str) if min_str else -99999.0
+        v_max = safe_float(max_str) if max_str else 99999.0
+        
+        if v_min == 0.0 and v_max == 0.0:
+            v_min, v_max = -99999.0, 99999.0
+            has_bounds = False
+        else:
+            has_bounds = bool(min_str) or bool(max_str)
+        
+        raw_step = safe_float(self.var.get("steps", ""))
+        step = raw_step if raw_step else (1.0 if is_int else 0.01)
+        step = max(0.0001, step)
+        
+        current_val = self.snap_value(self.var["display_value"], step, v_min, v_max)
+        
+        # Setup Debounce Timer to prevent FreeCAD recompute flooding
+        self.debounce_timer = QtCore.QTimer(self)
+        self.debounce_timer.setSingleShot(True)
+        self.debounce_timer.setInterval(400)
+        self.debounce_timer.timeout.connect(self.on_numeric_commit)
+        
+        # Spinbox Setup
+        if is_int:
+            self.spinbox = QtWidgets.QSpinBox()
+            self.spinbox.setRange(int(v_min), int(v_max))
+            self.spinbox.setSingleStep(int(step))
+            self.spinbox.setValue(int(current_val))
+            self.spinbox.valueChanged.connect(lambda val: self.sync_slider_from_spinbox(val, step, v_min, v_max))
+        else:
+            self.spinbox = QtWidgets.QDoubleSpinBox()
+            self.spinbox.setDecimals(3 if step < 0.1 else 2)
+            self.spinbox.setRange(v_min, v_max)
+            self.spinbox.setSingleStep(step)
+            self.spinbox.setValue(current_val)
+            if unit := self.var.get("unit", ""):
+                self.spinbox.setSuffix(f" {unit}")
+            self.spinbox.valueChanged.connect(lambda val: self.sync_slider_from_spinbox(val, step, v_min, v_max))
+            
+        self.spinbox.setStyleSheet("font-size: 11px;")
+        self.last_committed_value = self.spinbox.value()
+        self.spinbox.editingFinished.connect(self.force_commit)
+
+        # Slider Setup (only if bounds exist)
+        if has_bounds:
+            self.slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+            slider_max = int((v_max - v_min) / step)
+            slider_val = int((current_val - v_min) / step)
+            
+            self.slider.setRange(0, slider_max)
+            self.slider.setSingleStep(1)
+            self.slider.setPageStep(1)
+            self.slider.setValue(slider_val)
+            
+            self.slider.valueChanged.connect(lambda val: self.sync_spinbox_from_slider(val, step, v_min, v_max, is_int))
+            self.slider.sliderReleased.connect(self.force_commit)
+            layout.addWidget(self.slider)
+
+        layout.addWidget(self.spinbox)
+
+    def sync_spinbox_from_slider(self, slider_val, step, v_min, v_max, is_int):
+        """Calculates real value from step-index and updates spinbox."""
+        real_val = v_min + (slider_val * step)
+        snapped = self.snap_value(real_val, step, v_min, v_max)
+        if is_int: snapped = int(snapped)
+            
+        self.spinbox.blockSignals(True)
+        self.spinbox.setValue(snapped)
+        self.spinbox.blockSignals(False)
+        self.debounce_timer.start()
+
+    def sync_slider_from_spinbox(self, val, step, v_min, v_max):
+        """Calculates step-index from real value and updates slider."""
+        snapped = self.snap_value(val, step, v_min, v_max)
+        if hasattr(self, 'slider'):
+            slider_val = int((snapped - v_min) / step)
+            self.slider.blockSignals(True)
+            self.slider.setValue(slider_val)
+            self.slider.blockSignals(False)
+        self.debounce_timer.start()
+
+    def snap_value(self, value, step, minv, maxv):
+        if step <= 0: return value
+        snapped = minv + round((value - minv) / step) * step
+        return max(minv, min(round(snapped, 10), maxv))
+
+    def force_commit(self):
+        self.debounce_timer.stop()
+        self.on_numeric_commit()
+
+    def on_numeric_commit(self):
+        current_val = self.spinbox.value()
+        if hasattr(self, 'last_committed_value') and self.last_committed_value == current_val:
+            return
+        self.last_committed_value = current_val
+        self.update_callback(self.var["row"], current_val, self.var["type"], self.var.get("unit", ""))
+
+    def on_bool_changed(self, checked):
+        self.update_callback(self.var["row"], str(checked), "Boolean")
+
+    def on_string_changed(self):
+        self.update_callback(self.var["row"], self.line_edit.text(), "String")
+
+    # --- Drag & Drop / Hover Events ---
+    
+    def drag_handle_mouse_press(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self._drag_start_pos = event.position().toPoint()
+            self.drag_handle.setCursor(QtCore.Qt.CursorShape.ClosedHandCursor)
+
+    def drag_handle_mouse_move(self, event):
+        if self._drag_start_pos and not self._dragging:
+            if (event.position().toPoint() - self._drag_start_pos).manhattanLength() > 10:
+                self._dragging = True
+                self._start_drag()
+
+    def drag_handle_mouse_release(self, event):
+        self._drag_start_pos = None
+        self._dragging = False
+        self.drag_handle.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
+
+    def _start_drag(self):
+        drag = QtGui.QDrag(self)
+        mime_data = QtCore.QMimeData()
+        mime_data.setText(f"{self.var['row']}|{self.var['group']}|{self.var['order_id']}")
+        drag.setMimeData(mime_data)
+        drag.setHotSpot(QtCore.QPoint(10, 10))
+        drag.exec(QtCore.Qt.DropAction.MoveAction)
+        self._drag_start_pos = None
+        self._dragging = False
+        self.drag_handle.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
+
+    def enterEvent(self, event):
+        if not self.editing_locked:
+            self._hovered = True
+            self.update()
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        if self._hovered and not self.editing_locked:
+            painter.setBrush(QtGui.QColor("#3a3a3a"))
+            painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(self.rect().adjusted(0, 1, 0, -1), 3, 3)
+        super().paintEvent(event)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasText():
+            event.setDropAction(QtCore.Qt.DropAction.MoveAction)
+            event.accept()
+        else: event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasText():
+            event.setDropAction(QtCore.Qt.DropAction.MoveAction)
+            event.accept()
+        else: event.ignore()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasText():
+            data = event.mimeData().text().split("|")
+            if int(data[0]) != self.var["row"]:
+                self.reorder_callback(
+                    source_row=int(data[0]), source_group=data[1], source_order=int(data[2]),
+                    target_row=self.var["row"], target_group=self.var["group"], target_order=self.var["order_id"]
+                )
+            event.setDropAction(QtCore.Qt.DropAction.MoveAction)
+            event.accept()
+        else: event.ignore()
+
+    def mousePressEvent(self, event):
+        if self.editing_locked: return
+        if event.button() == QtCore.Qt.LeftButton:
+            if not self.drag_handle.geometry().contains(event.position().toPoint()):
+                self.edit_callback(self.var["row"])
+
+
+class CustomizerPanel(QtWidgets.QDialog):
+    
+    # UI Styling
+    BTN_STYLES = {
+        "blue": "QPushButton { font-weight: bold; color: white; padding: 6px 12px; border: none; border-radius: 4px; background-color: #2a72d4; } QPushButton:hover { background-color: #1a5cb8; }",
+        "green": "QPushButton { font-weight: bold; color: white; padding: 6px 12px; border: none; border-radius: 4px; background-color: #388e3c; } QPushButton:hover { background-color: #2d7230; }",
+        "red": "QPushButton { font-weight: bold; color: white; padding: 6px 12px; border: none; border-radius: 4px; background-color: #d32f2f; } QPushButton:hover { background-color: #b71c1c; }",
+        "orange": "QPushButton { font-weight: bold; color: white; padding: 6px 12px; border: none; border-radius: 4px; background-color: #f39c12; } QPushButton:hover { background-color: #d68910; }",
+        "default": "QPushButton { padding: 6px 12px; border: 1px solid #555; border-radius: 4px; background-color: #3a3a3a; color: #ddd; } QPushButton:hover { background-color: #4a4a4a; }"
+    }
+    
+    # Spreadsheet Schema Mapping
+    SCHEMA = {
+        "ID": "A", "NAME": "B", "GROUP": "C", "TYPE": "D", "TOOLTIP": "E", 
+        "VALUE": "F", "MIN": "G", "MAX": "H", "STEPS": "I", "UNIT": "J"
+    }
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.doc = App.ActiveDocument
+        if not self.doc:
+            QtWidgets.QMessageBox.warning(None, "Error", "No document open")
+            return
+        
+        self.sheet = self.get_or_create_spreadsheet()
+        self.editing_row = None
+        self.prev_name = ""
+        self._empty = 0
+        self.init_ui()
+
+    # --- Utility Methods ---
+    
+    def to_base_unit(self, value, unit, v_type):
+        if not unit: return value
+        try:
+            q = App.Units.Quantity(f"{value} {unit}")
+            if v_type.lower() == "length":
+                return q.getValueAs("mm")
+            if v_type.lower() == "angle":
+                return q.getValueAs("deg")
+        except:
+            pass
+        return value
+
+    def from_base_unit(self, value, unit, v_type):
+        if not unit: return value
+        try:
+            if v_type.lower() == "length":
+                q = App.Units.Quantity(value, App.Units.Length)
+                return q.getValueAs(unit)
+            if v_type.lower() == "angle":
+                q = App.Units.Quantity(value, App.Units.Angle)
+                return q.getValueAs(unit)
+        except:
+            pass
+        return value
+
+    def get_or_create_spreadsheet(self):
+        sheet = self.doc.getObject("Customizer")
+        if sheet and sheet.TypeId == "Spreadsheet::Sheet":
+            if sheet.getContents(f"{self.SCHEMA['NAME']}1").strip("'") == "Name":
+                return sheet
+                
+        sheet = self.doc.addObject("Spreadsheet::Sheet", "Customizer")
+        headers = ["ID", "Name", "Group", "Type", "Tooltip", "Value", "Min", "Max", "Steps", "Unit"]
+        for i, header in enumerate(headers):
+            col = chr(65 + i)
+            sheet.set(f"{col}1", f"'{header}")
+            sheet.setStyle(f"{col}1", "bold", "add")
+            
+        self.doc.recompute()
+        return sheet
+
+    def _make_btn(self, text, style_key, callback):
+        btn = QtWidgets.QPushButton(text)
+        btn.setStyleSheet(self.BTN_STYLES[style_key])
+        btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        btn.clicked.connect(callback)
+        return btn
+
+    def get_num(self, val):
+        if val is None: return 0.0
+        if hasattr(val, 'Value'):
+            try: return float(val.Value)
+            except: return 0.0
+        try: return float(str(val).replace("'", "").strip())
+        except: return 0.0
+
+    # --- Core UI Setup ---
+
+    def init_ui(self):
+        self.setWindowTitle("Customizer")
+        self.setMinimumWidth(400)
+        self.resize(400, 600)
+        self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.WindowStaysOnTopHint)
+        
+        main_layout = QtWidgets.QVBoxLayout(self)
+        
+        # Workspace Area
+        workspace_container = QtWidgets.QWidget()
+        workspace_layout = QtWidgets.QVBoxLayout(workspace_container)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll_content = QtWidgets.QWidget()
+        self.workspace_layout = QtWidgets.QVBoxLayout(self.scroll_content)
+        self.scroll_content.setLayout(self.workspace_layout)
+        self.scroll.setWidget(self.scroll_content)
+        workspace_layout.addWidget(self.scroll)
+        main_layout.addWidget(workspace_container, 1)
+        
+        # Lock Overlay (for dimming workspace during edit)
+        self.lock_overlay = QtWidgets.QWidget(workspace_container)
+        self.lock_overlay.setStyleSheet("background-color: rgba(0, 0, 0, 160);")
+        self.lock_overlay.hide()
+        workspace_container.installEventFilter(self)
+        
+        # Top Level Controls
+        self.btn_show_add = self._make_btn("+ Add Variable", "blue", self.show_add_form)
+        self.btn_show_add.setStyleSheet(self.btn_show_add.styleSheet() + " padding: 8px; font-size: 13px;")
+        main_layout.addWidget(self.btn_show_add)
+        
+        self.init_form_ui(main_layout)
+        
+        # Bottom Bar
+        bottom_bar = QtWidgets.QHBoxLayout()
+        self.chk_live = QtWidgets.QCheckBox("Live Recompute")
+        self.chk_live.setChecked(True)
+        bottom_bar.addWidget(self.chk_live)
+        bottom_bar.addStretch()
+        bottom_bar.addWidget(self._make_btn("Recompute Now", "orange", self.doc.recompute))
+        main_layout.addLayout(bottom_bar)
+        
+        self.refresh_workspace()
+
+    def init_form_ui(self, parent_layout):
+        self.form_box = QtWidgets.QGroupBox()
+        self.form_box.hide()
+        grid = QtWidgets.QGridLayout(self.form_box)
+        
+        # Shared Form Inputs
+        self.f_name = QtWidgets.QLineEdit()
+        self.f_name.setPlaceholderText("e.g. BoxWidth")
+        self.f_name.textChanged.connect(self.on_name_auto_format)
+        
+        self.f_group = QtWidgets.QLineEdit("Dimensions")
+        
+        self.f_type = QtWidgets.QComboBox()
+        self.f_type.addItems(["Length", "Float", "Integer", "Angle", "Boolean", "String"])
+        self.f_type.currentTextChanged.connect(self.on_form_type_changed)
+        
+        self.f_val_num = QtWidgets.QDoubleSpinBox()
+        self.f_val_num.setRange(-999999, 999999)
+        self.f_val_num.setDecimals(2)
+        self.f_val_num.setValue(10)
+        
+        self.f_val_str = QtWidgets.QLineEdit("")
+        self.f_val_str.hide()
+        
+        self.f_val_bool = QtWidgets.QCheckBox("Enabled")
+        self.f_val_bool.hide()
+        
+        self.f_unit_label = QtWidgets.QLabel("Unit:")
+        self.f_unit = QtWidgets.QComboBox()
+        
+        self.f_tooltip = QtWidgets.QLineEdit()
+        
+        self.f_min = QtWidgets.QDoubleSpinBox()
+        self.f_min.setRange(-999999, 999999)
+        self.f_min.setDecimals(2)
+        self.f_min.setValue(0)
+        
+        self.f_max = QtWidgets.QDoubleSpinBox()
+        self.f_max.setRange(-999999, 999999)
+        self.f_max.setDecimals(2)
+        self.f_max.setValue(0)
+        
+        self.f_steps = QtWidgets.QDoubleSpinBox()
+        self.f_steps.setRange(0, 999999)
+        self.f_steps.setDecimals(2)
+        self.f_steps.setValue(0)
+        
+        # Grid Layout Placement
+        grid.addWidget(QtWidgets.QLabel("Name (Alias):"), 0, 0)
+        grid.addWidget(self.f_name, 0, 1, 1, 3)
+        
+        grid.addWidget(QtWidgets.QLabel("Group:"), 1, 0)
+        grid.addWidget(self.f_group, 1, 1)
+        grid.addWidget(QtWidgets.QLabel("Type:"), 1, 2)
+        grid.addWidget(self.f_type, 1, 3)
+        
+        grid.addWidget(QtWidgets.QLabel("Value:"), 2, 0)
+        grid.addWidget(self.f_val_num, 2, 1)
+        grid.addWidget(self.f_val_str, 2, 1)
+        grid.addWidget(self.f_val_bool, 2, 1)
+        
+        grid.addWidget(self.f_unit_label, 2, 2)
+        grid.addWidget(self.f_unit, 2, 3)
+        
+        grid.addWidget(QtWidgets.QLabel("Tooltip:"), 3, 0)
+        grid.addWidget(self.f_tooltip, 3, 1, 1, 3)
+        
+        self.f_min_label = QtWidgets.QLabel("Min:")
+        self.f_max_label = QtWidgets.QLabel("Max:")
+        self.f_step_label = QtWidgets.QLabel("Step:")
+        
+        grid.addWidget(self.f_min_label, 4, 0)
+        grid.addWidget(self.f_min, 4, 1)
+        grid.addWidget(self.f_max_label, 4, 2)
+        grid.addWidget(self.f_max, 4, 3)
+        grid.addWidget(self.f_step_label, 5, 0)
+        grid.addWidget(self.f_steps, 5, 1)
+        
+        # Dynamic Action Buttons
+        button_layout = QtWidgets.QHBoxLayout()
+        self.btn_save = self._make_btn("Save Variable", "blue", self.add_variable)
+        self.btn_update = self._make_btn("Update Variable", "green", self.update_variable)
+        self.btn_delete = self._make_btn("Delete", "red", self.delete_current_variable)
+        self.btn_cancel = self._make_btn("Cancel", "default", self.hide_form)
+        
+        button_layout.addWidget(self.btn_save)
+        button_layout.addWidget(self.btn_update)
+        button_layout.addWidget(self.btn_delete)
+        button_layout.addWidget(self.btn_cancel)
+        grid.addLayout(button_layout, 6, 0, 1, 4)
+        
+        parent_layout.addWidget(self.form_box)
+
+    # --- Form Interactions & Logic ---
+    
+    def on_name_auto_format(self, text):
+        if not self.f_name.text() or self.f_name.text() == self.prev_name:
+            self.f_name.setText(text.replace("_", " ").strip())
+        self.prev_name = self.f_name.text()
+
+    def on_form_type_changed(self, v_type):
+        """Adjusts the visibility of inputs based on selected variable type."""
+        is_num = v_type not in ["Boolean", "String"]
+        is_bool = v_type == "Boolean"
+        is_str = v_type == "String"
+        is_dimensional = v_type in ["Length", "Angle"]
+        
+        self.f_val_num.setVisible(is_num)
+        self.f_val_str.setVisible(is_str)
+        self.f_val_bool.setVisible(is_bool)
+        
+        self.f_min_label.setVisible(is_num)
+        self.f_min.setVisible(is_num)
+        self.f_max_label.setVisible(is_num)
+        self.f_max.setVisible(is_num)
+        self.f_step_label.setVisible(is_num)
+        self.f_steps.setVisible(is_num)
+        
+        self.f_unit_label.setVisible(is_dimensional)
+        self.f_unit.setVisible(is_dimensional)
+        
+        if is_num:
+            self.f_val_num.setDecimals(0 if v_type == "Integer" else 2)
+
+        if v_type == "Length":
+            self.f_unit.blockSignals(True)
+            self.f_unit.clear()
+            self.f_unit.addItems(["μm", "mm", "cm", "m", "in", "ft"])
+            self.f_unit.setCurrentText("mm")
+            self.f_unit.blockSignals(False)
+        elif v_type == "Angle":
+            self.f_unit.blockSignals(True)
+            self.f_unit.clear()
+            self.f_unit.addItems(["deg", "rad"])
+            self.f_unit.setCurrentText("deg")
+            self.f_unit.blockSignals(False)
+
+    def _update_lock_overlay(self):
+        if parent := self.lock_overlay.parent():
+            self.lock_overlay.setGeometry(parent.rect())
+
+    def show_add_form(self):
+        self.editing_row = None
+        self.form_box.setTitle("Add Variable")
+        
+        self.f_name.clear()
+        self.f_group.setText("Dimensions")
+        self.f_type.setCurrentIndex(0)
+        self.f_val_num.setValue(10)
+        self.f_val_str.clear()
+        self.f_val_bool.setChecked(False)
+        self.f_tooltip.clear()
+        self.f_min.setValue(0)
+        self.f_max.setValue(0)
+        self.f_steps.setValue(0)
+        self.on_form_type_changed("Length")
+        
+        self.btn_save.show()
+        self.btn_update.hide()
+        self.btn_delete.hide()
+        
+        self.btn_show_add.hide()
+        self.form_box.show()
+        self._update_lock_overlay()
+        self.lock_overlay.show()
+        self.lock_overlay.raise_()
+        self.f_name.setFocus()
+
+    def show_edit_form(self, row_data):
+        self.editing_row = row_data["row"]
+        self.form_box.setTitle("Edit Variable")
+        
+        self.f_name.setText(row_data["name"])
+        self.f_group.setText(row_data["group"])
+        self.f_tooltip.setText(row_data["tooltip"])
+        
+        idx = self.f_type.findText(row_data["type"])
+        if idx >= 0:
+            self.f_type.blockSignals(True)
+            self.f_type.setCurrentIndex(idx)
+            self.f_type.blockSignals(False)
+        
+        self.on_form_type_changed(row_data["type"])
+        
+        if row_data["unit"]:
+            unit_idx = self.f_unit.findText(row_data["unit"])
+            if unit_idx >= 0:
+                self.f_unit.setCurrentIndex(unit_idx)
+            
+        v_type = row_data["type"].lower()
+        if v_type in ["boolean", "bool"]:
+            self.f_val_bool.setChecked(str(row_data["value_raw"]).lower() in ['true', '1'])
+        elif v_type in ["string", "str"]:
+            self.f_val_str.setText(str(row_data["value_raw"]).strip("'"))
+        else:
+            self.f_val_num.setValue(float(row_data["display_value"]))
+            
+        self.f_min.setValue(float(row_data["min"]) if row_data["min"] else 0)
+        self.f_max.setValue(float(row_data["max"]) if row_data["max"] else 0)
+        self.f_steps.setValue(float(row_data["steps"]) if row_data["steps"] else 0)
+
+        self.btn_save.hide()
+        self.btn_update.show()
+        self.btn_delete.show()
+
+        self.btn_show_add.hide()
+        self.form_box.show()
+        self._update_lock_overlay()
+        self.lock_overlay.show()
+        self.lock_overlay.raise_()
+
+    def hide_form(self):
+        self.form_box.hide()
+        self.btn_show_add.show()
+        self.lock_overlay.hide()
+        self.editing_row = None
+        self.refresh_workspace()
+
+    # --- Event Handlers ---
+
+    def eventFilter(self, obj, event):
+        if obj == self.lock_overlay.parent() and event.type() == QtCore.QEvent.Type.Resize:
+            self.lock_overlay.setGeometry(obj.rect())
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            if self.form_box.isVisible():
+                self.hide_form()
+                return
+            if focused := QtWidgets.QApplication.focusWidget():
+                focused.clearFocus()
+            return
+            
+        if event.key() in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter):
+            if focused := QtWidgets.QApplication.focusWidget():
+                if isinstance(focused, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox, QtWidgets.QLineEdit)):
+                    focused.clearFocus()
+                    return
+        super().keyPressEvent(event)
+
+    # --- Spreadsheet Operations ---
+    
+    def _read_row_data(self, row):
+        def g(col_key): return self.sheet.getContents(f"{self.SCHEMA[col_key]}{row}").strip("'")
+        
+        name = g("NAME")
+        if not name: return None
+        
+        tp = g("TYPE") or "Float"
+        unit = g("UNIT")
+        raw_val = self.sheet.get(f"{self.SCHEMA['VALUE']}{row}")
+        base_val = self.get_num(raw_val)
+        display_val = self.from_base_unit(base_val, unit, tp) if tp in ["Length", "Angle"] and unit else base_val
+        
+        try: order_id = int(g("ID")) if g("ID") else 0
+        except: order_id = 0
+
+        return {
+            "row": row,
+            "name": name,
+            "order_id": order_id,
+            "group": g("GROUP") or "General",
+            "type": tp,
+            "tooltip": g("TOOLTIP"),
+            "min": g("MIN"),
+            "max": g("MAX"),
+            "steps": g("STEPS"),
+            "unit": unit,
+            "value_raw": raw_val,
+            "display_value": display_val
+        }
+
+    def load_variable_for_edit(self, row):
+        if self.form_box.isVisible() and self.editing_row is not None and self.editing_row != row:
+            return
+        if row_data := self._read_row_data(row):
+            self.show_edit_form(row_data)
+
+    def reorder_variables(self, source_row, source_group, source_order, target_row, target_group, target_order):
+        self.doc.openTransaction("Reorder Customizer Variables")
+        try:
+            target_vars = []
+            for row in range(2, 1000):
+                if row == source_row: continue
+                if data := self._read_row_data(row):
+                    if data["group"] == target_group:
+                        target_vars.append((row, data["order_id"]))
+            
+            target_vars.sort(key=lambda x: x[1])
+            new_order = []
+            inserted = False
+            
+            for r, oid in target_vars:
+                if not inserted and (oid >= target_order if source_order > target_order else oid > target_order):
+                    new_order.append(source_row)
+                    inserted = True
+                new_order.append(r)
+            if not inserted: new_order.append(source_row)
+            
+            for i, r in enumerate(new_order):
+                self.sheet.set(f"{self.SCHEMA['ID']}{r}", f"'{10 + i * 10}")
+            
+            if source_group != target_group:
+                self.sheet.set(f"{self.SCHEMA['GROUP']}{source_row}", f"'{target_group}")
+            
+            self.doc.recompute()
+        finally:
+            self.doc.commitTransaction()
+        self.refresh_workspace()
+
+    def add_variable(self):
+        row = 2
+        while self.sheet.getContents(f"{self.SCHEMA['NAME']}{row}").strip("'"): row += 1
+        if self._write_variable_to_sheet(row, is_new=True):
+            self.hide_form()
+
+    def update_variable(self):
+        if self.editing_row is None: return
+        if self._write_variable_to_sheet(self.editing_row, is_new=False):
+            self.hide_form()
+
+    def delete_current_variable(self):
+        if self.editing_row is None: return
+        name = self.sheet.getContents(f"{self.SCHEMA['NAME']}{self.editing_row}").strip("'")
+        
+        reply = QtWidgets.QMessageBox.question(
+            self, "Confirm", f"Delete '{name}'?", QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+        )
+        if reply == QtWidgets.QMessageBox.Yes:
+            self.sheet.removeRows(str(self.editing_row), 1)
+            if self.chk_live.isChecked(): self.doc.recompute()
+            self.hide_form()
+
+    def _write_variable_to_sheet(self, row, is_new):
+        v_type = self.f_type.currentText()
+        alias_name = self.f_name.text().strip().replace(" ", "_")
+        unit = self.f_unit.currentText() if v_type in ["Length", "Angle"] else ""
+        
+        if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', alias_name):
+            QtWidgets.QMessageBox.warning(self, "Invalid", "Name must start with a letter or underscore.")
+            return False
+
+        if v_type == "Boolean":
+            val_str = str(self.f_val_bool.isChecked())
+        elif v_type == "String":
+            val_str = self.f_val_str.text()
+        else:
+            base_val = self.to_base_unit(self.f_val_num.value(), unit, v_type)
+            val_str = str(base_val)
+
+        old_alias = ""
+        if not is_new:
+            old_alias = self.sheet.getContents(f"{self.SCHEMA['NAME']}{row}").strip("'").replace(" ", "_")
+            if old_alias and old_alias != alias_name:
+                try: self.sheet.setAlias(f"{self.SCHEMA['VALUE']}{row}", "")
+                except: pass
+
+        if is_new:
+            id_val = 0
+            for r in range(2, 1000):
+                id_str = self.sheet.getContents(f"{self.SCHEMA['ID']}{r}").strip("'")
+                if id_str:
+                    try: id_val = max(id_val, int(id_str))
+                    except: pass
+            id_val += 10
+        else:
+            id_val = self.sheet.getContents(f"{self.SCHEMA['ID']}{row}").strip("'")
+
+        s = self.SCHEMA
+        self.sheet.set(f"{s['ID']}{row}", f"'{id_val}")
+        self.sheet.set(f"{s['NAME']}{row}", f"'{self.f_name.text().strip()}")
+        self.sheet.set(f"{s['GROUP']}{row}", f"'{self.f_group.text().strip()}")
+        self.sheet.set(f"{s['TYPE']}{row}", f"'{v_type}")
+        self.sheet.set(f"{s['TOOLTIP']}{row}", f"'{self.f_tooltip.text().strip()}")
+        
+        if v_type == "Boolean":
+            val_int = 1 if val_str == 'True' else 0
+            self.sheet.set(f"{s['VALUE']}{row}", f"=({val_int}==1)")
+        elif v_type == "String":
+            self.sheet.set(f"{s['VALUE']}{row}", f"'{val_str}")
+        else:
+            self.sheet.set(f"{s['VALUE']}{row}", val_str)
+            if v_type in ["Length", "Angle"]:
+                self.sheet.setDisplayUnit(f"{s['VALUE']}{row}", unit)
+                
+        for col in [s['MIN'], s['MAX'], s['STEPS'], s['UNIT']]:
+            self.sheet.clear(f"{col}{row}")
+            
+        if v_type not in ["Boolean", "String"]:
+            self.sheet.set(f"{s['MIN']}{row}", str(self.f_min.value()))
+            self.sheet.set(f"{s['MAX']}{row}", str(self.f_max.value()))
+            if self.f_steps.value() > 0:
+                self.sheet.set(f"{s['STEPS']}{row}", str(self.f_steps.value()))
+            if unit:
+                self.sheet.set(f"{s['UNIT']}{row}", f"'{unit}")
+
+        try:
+            self.sheet.setAlias(f"{s['VALUE']}{row}", alias_name)
+        except Exception as e:
+            if is_new:
+                self.sheet.removeRows(str(row), 1)
+            elif old_alias:
+                try: self.sheet.setAlias(f"{s['VALUE']}{row}", old_alias)
+                except: pass
+            QtWidgets.QMessageBox.warning(self, "Error", f"FreeCAD rejected alias '{alias_name}': {e}")
+            return False
+            
+        if self.chk_live.isChecked():
+            self.doc.recompute()
+        
+        return True
+
+    def update_sheet(self, row, val, v_type, unit=""):
+        if not self.sheet: return
+        
+        self.doc.openTransaction(f"Customizer: Update Row {row}")
+        try:
+            vt = v_type.lower()
+            cell = f"{self.SCHEMA['VALUE']}{row}"
+            
+            if vt in ["length", "angle"] and unit:
+                bv = self.to_base_unit(float(val), unit, v_type.capitalize())
+            else:
+                bv = val
+                
+            if vt == "length":
+                self.sheet.set(cell, str(bv))
+                self.sheet.setDisplayUnit(cell, unit or "mm")
+            elif vt == "angle":
+                self.sheet.set(cell, str(bv))
+                self.sheet.setDisplayUnit(cell, unit or "deg")
+            elif vt in ["boolean", "bool"]:
+                val_int = 1 if str(val).lower() in ['true', '1'] else 0
+                self.sheet.set(cell, f"=({val_int}==1)")
+            elif vt in ["string", "str"]:
+                self.sheet.set(cell, f"'{val}")
+            else:
+                self.sheet.set(cell, str(val))
+                
+            if self.chk_live.isChecked():
+                self.doc.recompute()
+        finally:
+            self.doc.commitTransaction()
+
+    def refresh_workspace(self):
+        v_bar = self.scroll.verticalScrollBar()
+        scroll_pos = v_bar.value()
+        
+        while self.workspace_layout.count():
+            item = self.workspace_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        if not self.sheet:
+            self.workspace_layout.addWidget(QtWidgets.QLabel("No spreadsheet found."))
+            self.workspace_layout.addStretch()
+            return
+        
+        groups = {}
+        empty_count = 0
+        for row in range(2, 1000):
+            row_data = self._read_row_data(row)
+            if not row_data:
+                empty_count += 1
+                if empty_count >= 10: break
+                continue
+                
+            empty_count = 0
+            groups.setdefault(row_data["group"], []).append(row_data)
+        
+        editing_locked = self.form_box.isVisible()
+        
+        for gname in sorted(groups.keys()):
+            groups[gname].sort(key=lambda x: x["order_id"])
+            group_box = QtWidgets.QGroupBox(gname)
+            group_layout = QtWidgets.QVBoxLayout(group_box)
+            group_layout.setContentsMargins(2, 4, 2, 2)
+            
+            for var_data in groups[gname]:
+                row_widget = VariableRowWidget(
+                    var_data, self.update_sheet, self.load_variable_for_edit,
+                    self.reorder_variables, editing_locked=editing_locked
+                )
+                group_layout.addWidget(row_widget)
+                
+            self.workspace_layout.addWidget(group_box)
+            
+        self.workspace_layout.addStretch()
+        QtWidgets.QApplication.processEvents()
+        v_bar.setValue(scroll_pos)
+
+for widget in QtWidgets.QApplication.topLevelWidgets():
+    if isinstance(widget, QtWidgets.QDialog) and widget.windowTitle() == "Customizer":
+        widget.close()
+
+panel = CustomizerPanel()
+panel.show()
